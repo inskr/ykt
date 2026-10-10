@@ -3,11 +3,55 @@ import unittest
 
 import requests
 
-from test_ykt_progress import OfflineSession, mp4_fixture
+from test_ykt_progress import OfflineResponse, OfflineSession, mp4_fixture
 from ykt_video_metadata import read_playback_duration
 
 
 ORIGINS = ('https://xidianyjs.yuketang.cn', 'https://www.yuketang.cn')
+
+
+class PlaylistResponse(OfflineResponse):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.closed = False
+        self.bytes_read = 0
+
+    def iter_content(self, chunk_size=8192):
+        for chunk in super().iter_content(chunk_size):
+            self.bytes_read += len(chunk)
+            yield chunk
+
+    def close(self):
+        self.closed = True
+
+
+class PlaylistSession(OfflineSession):
+    def __init__(self, resources, content_type='', supports_ranges=False):
+        super().__init__([{}])
+        self.resources = resources
+        self.content_type = content_type
+        self.supports_ranges = supports_ranges
+        self.responses = []
+
+    def get(self, url, **kwargs):
+        if url not in self.resources:
+            return super().get(url, **kwargs)
+        self.playback_requests.append((url, kwargs))
+        body, final_url = self.resources[url]
+        body = body.encode('utf-8') if isinstance(body, str) else body
+        headers = {'Content-Type': self.content_type}
+        status = 200
+        range_header = kwargs.get('headers', {}).get('Range')
+        if self.supports_ranges and range_header:
+            start, end = map(int, range_header.removeprefix('bytes=').split('-'))
+            total = len(body)
+            body = body[start:end + 1]
+            headers['Content-Range'] = f'bytes {start}-{start + len(body) - 1}/{total}'
+            status = 206
+        response = PlaylistResponse(body, status, headers)
+        response.url = final_url or url
+        self.responses.append(response)
+        return response
 
 
 class VideoMetadataTests(unittest.TestCase):
@@ -18,6 +62,81 @@ class VideoMetadataTests(unittest.TestCase):
             'ccid': 'test-video', 'playurl': playurl,
         }, ORIGINS, {'xtbz': 'ykt'})
         return session, result
+
+    def test_extensionless_hls_with_mime_and_without_content_length(self):
+        url = 'https://media.example/manifest?id=example&signature=private-token'
+        for content_type in ('application/vnd.apple.mpegurl; charset=utf-8',
+                             'application/x-mpegURL'):
+            with self.subTest(content_type=content_type):
+                session = PlaylistSession({url: (
+                    '#EXTM3U\n#EXTINF:8.25,\na.ts\n#EXTINF:12,\nb.ts\n#EXT-X-ENDLIST\n',
+                    None)}, content_type)
+                duration, source = read_playback_duration(session, {
+                    'ccid': 'test-video', 'playurl': {'sources': {'quality10': [url]}},
+                }, ORIGINS, {})
+                self.assertEqual(duration, 20.25)
+                self.assertEqual(source, 'HLS 播放清单')
+                self.assertTrue(all(response.closed for response in session.responses))
+
+    def test_extensionless_hls_detects_content_despite_generic_mime(self):
+        url = 'https://media.example/manifest'
+        session = PlaylistSession({url: (
+            '\ufeff#EXTM3U\n#EXTINF:20.25,\na.ts\n#EXT-X-ENDLIST\n', None)},
+            'application/octet-stream')
+        duration, _ = read_playback_duration(session, {
+            'ccid': 'test-video', 'playurl': url,
+        }, ORIGINS, {})
+        self.assertEqual(duration, 20.25)
+
+    def test_extensionless_hls_reads_beyond_initial_range(self):
+        url = 'https://media.example/manifest'
+        body = '#EXTM3U\n' + '# comment\n' * 7000 + '#EXTINF:20.25,\na.ts\n#EXT-X-ENDLIST\n'
+        session = PlaylistSession({url: (body, None)}, supports_ranges=True)
+        duration, _ = read_playback_duration(session, {
+            'ccid': 'test-video', 'playurl': url,
+        }, ORIGINS, {})
+        self.assertEqual(duration, 20.25)
+        self.assertTrue(all(response.closed for response in session.responses))
+
+    def test_extensionless_redirected_master_resolves_relative_playlist(self):
+        master = 'https://media.example/manifest'
+        final = 'https://cdn.example/path/master'
+        child = 'https://cdn.example/path/low/manifest'
+        session = PlaylistSession({
+            master: ('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nlow/manifest\n', final),
+            final: ('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nlow/manifest\n', final),
+            child: ('#EXTM3U\n#EXTINF:20.25,\na.ts\n#EXT-X-ENDLIST\n', None),
+        })
+        duration, _ = read_playback_duration(session, {
+            'ccid': 'test-video', 'playurl': master,
+        }, ORIGINS, {})
+        self.assertEqual(duration, 20.25)
+        self.assertIn(child, [url for url, _ in session.playback_requests])
+        self.assertTrue(all(response.closed for response in session.responses))
+
+    def test_extensionless_live_hls_has_no_confirmed_duration(self):
+        url = 'https://media.example/live?signature=private-token'
+        session = PlaylistSession({url: ('#EXTM3U\n#EXTINF:6,\na.ts\n', None)})
+        duration, reason = read_playback_duration(session, {
+            'ccid': 'test-video', 'playurl': url,
+        }, ORIGINS, {})
+        self.assertEqual(duration, 0)
+        self.assertIn('没有可确认总时长', reason)
+        self.assertNotIn('private-token', reason)
+        self.assertTrue(all(response.closed for response in session.responses))
+
+    def test_extensionless_oversized_hls_is_rejected_and_closed(self):
+        url = 'https://media.example/manifest'
+        body = '#EXTM3U\n' + '# comment\n' * 220000 + '#EXTINF:6,\na.ts\n#EXT-X-ENDLIST\n'
+        session = PlaylistSession({url: (body, None)})
+        duration, reason = read_playback_duration(session, {
+            'ccid': 'test-video', 'playurl': url,
+        }, ORIGINS, {})
+        self.assertEqual(duration, 0)
+        self.assertIn('超过读取上限', reason)
+        self.assertTrue(all(response.closed for response in session.responses))
+        self.assertTrue(all(response.bytes_read <= 1024 * 1024 + 8192
+                            for response in session.responses))
 
     def test_mp4_metadata_at_file_end_skips_video_data(self):
         url = 'https://media.example/end.mp4'

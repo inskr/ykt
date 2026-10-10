@@ -68,7 +68,7 @@ def playback_urls(playurl, origin):
             yield url, hls
 
 
-def read_resource(session, url, origin, limit, range_start=None):
+def read_resource(session, url, origin, limit, range_start=None, *, detect_hls=False):
     """只读取清单或少量元数据，及时关闭视频响应。"""
     headers = {'Referer': origin + '/', 'Accept-Encoding': 'identity'}
     if range_start is not None:
@@ -91,7 +91,8 @@ def read_resource(session, url, origin, limit, range_start=None):
                 try:
                     total = int(response.headers['Content-Length'])
                 except (KeyError, TypeError, ValueError):
-                    raise MetadataError('媒体服务器没有提供文件长度') from None
+                    if not detect_hls:
+                        raise MetadataError('媒体服务器没有提供文件长度') from None
         body = bytearray()
         for chunk in response.iter_content(chunk_size=8192):
             if not chunk:
@@ -99,11 +100,17 @@ def read_resource(session, url, origin, limit, range_start=None):
             if range_start is None and len(body) + len(chunk) > limit:
                 raise MetadataError('播放清单超过读取上限')
             body.extend(chunk[:limit - len(body)])
-            if len(body) >= limit:
+            if range_start is not None and len(body) >= limit:
                 break
         if not body:
             raise MetadataError('媒体服务器返回空内容')
-        return bytes(body), total, getattr(response, 'url', None) or url
+        content_type = response.headers.get('Content-Type', '').partition(';')[0].strip().lower()
+        hls = detect_hls and (
+            content_type in ('application/vnd.apple.mpegurl', 'application/x-mpegurl')
+            or body.removeprefix(b'\xef\xbb\xbf').lstrip().startswith(b'#EXTM3U'))
+        if range_start is not None and total is None and not hls:
+            raise MetadataError('媒体服务器没有提供文件长度')
+        return bytes(body), total, getattr(response, 'url', None) or url, hls
     finally:
         response.close()
 
@@ -111,7 +118,7 @@ def read_resource(session, url, origin, limit, range_start=None):
 def read_hls_duration(session, url, origin, depth=0):
     if depth > 2:
         raise MetadataError('播放清单嵌套过多')
-    body, _, final_url = read_resource(session, url, origin, 1024 * 1024)
+    body, _, final_url, _ = read_resource(session, url, origin, 1024 * 1024)
     lines = [line.strip() for line in body.decode('utf-8-sig').splitlines()]
     if not lines or lines[0] != '#EXTM3U':
         raise MetadataError('返回内容不是 HLS 播放清单')
@@ -142,9 +149,11 @@ def read_hls_duration(session, url, origin, depth=0):
     raise MetadataError('播放清单未提供可确认的视频时长')
 
 
-def read_mp4_duration(session, url, origin):
+def read_mp4_duration(session, url, origin, *, initial_resource=None):
     """定位 moov/mvhd，只读取文件头和电影时长信息。"""
-    initial, total, _ = read_resource(session, url, origin, 65536, range_start=0)
+    if initial_resource is None:
+        initial_resource = read_resource(session, url, origin, 65536, range_start=0)
+    initial, total, _, _ = initial_resource
     if not total or total < 8:
         raise MetadataError('视频文件长度无效')
     requests_left = 8
@@ -158,8 +167,8 @@ def read_mp4_duration(session, url, origin):
         if requests_left <= 0:
             raise MetadataError('视频元数据查询超过次数上限')
         requests_left -= 1
-        body, current_total, _ = read_resource(session, url, origin, length,
-                                               range_start=offset)
+        body, current_total, _, _ = read_resource(session, url, origin, length,
+                                                  range_start=offset)
         if current_total != total or len(body) != length:
             raise MetadataError('视频元数据不完整或文件长度已变化')
         return body
@@ -222,8 +231,16 @@ def read_playback_duration(session, media, origins, headers, *,
                     seconds = read_hls_duration(session, url, origin)
                     source = 'HLS 播放清单'
                 else:
-                    seconds = read_mp4_duration(session, url, origin)
-                    source = 'MP4 视频元数据'
+                    initial_resource = read_resource(session, url, origin, 65536,
+                                                     range_start=0, detect_hls=True)
+                    if initial_resource[3]:
+                        # 首次分段只用于识别格式，完整清单仍受 1 MiB 上限约束。
+                        seconds = read_hls_duration(session, initial_resource[2], origin)
+                        source = 'HLS 播放清单'
+                    else:
+                        seconds = read_mp4_duration(session, url, origin,
+                                                    initial_resource=initial_resource)
+                        source = 'MP4 视频元数据'
                 if positive_seconds(seconds):
                     return seconds, source
             except MetadataError as error:
